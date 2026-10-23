@@ -31,6 +31,7 @@
  * | `RATE_LIMIT_ISSUE_WALLET`       | 10      | max issue requests per wallet per window|
  * | `RATE_LIMIT_WITNESS_IP`         | 60      | max witness requests per IP per window  |
  * | `RATE_LIMIT_PLAID_IP`           | 30      | max plaid-balance requests per IP/window|
+ * | `RATE_LIMIT_CSP_REPORT_IP`      | 30      | max csp-report requests per IP/window   |
  * | `RATE_LIMIT_WINDOW_SECONDS`     | 60      | window length in seconds (all routes)   |
  *
  * ## Multi-instance / serverless deploy note
@@ -60,6 +61,7 @@
 import { createHash } from "crypto";
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
+import { getSharedStore, checkMultiInstanceStoreWarning } from "./shared-store";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -82,6 +84,8 @@ export const LIMITS = {
   witnessPerIp: () => readInt("RATE_LIMIT_WITNESS_IP", 60),
   /** Max requests per IP per window on /api/plaid-balance. */
   plaidPerIp: () => readInt("RATE_LIMIT_PLAID_IP", 30),
+  /** Max requests per IP per window on /api/csp-report. */
+  cspReportPerIp: () => readInt("RATE_LIMIT_CSP_REPORT_IP", 30),
   /** Window duration in milliseconds (shared by all routes). */
   windowMs: () => readInt("RATE_LIMIT_WINDOW_SECONDS", 60) * 1000,
 } as const;
@@ -100,6 +104,57 @@ interface Bucket {
 const store = new Map<string, Bucket>();
 
 /**
+ * Hard cap on tracked buckets. When the map exceeds this, the oldest
+ * (earliest-inserted, and therefore soonest-to-expire) entries are evicted
+ * until it is back under the cap. Chosen so a flood of distinct keys cannot
+ * grow process memory without bound.
+ *
+ * Eviction fails *open* for the evicted key (it gets a fresh window on its
+ * next request). That is the safe direction for a limiter: the alternative,
+ * unbounded growth, is a denial-of-service vector.
+ *
+ * Tunable via RATE_LIMIT_MAX_BUCKETS for load-testing.
+ */
+function maxBuckets(): number {
+  return readInt("RATE_LIMIT_MAX_BUCKETS", 10_000);
+}
+
+/**
+ * Minimum interval between opportunistic evictions, so we do not walk the
+ * whole map on every request. Bounded work on the hot path matters more than
+ * perfect liveness of the sweep.
+ */
+const EVICTION_INTERVAL_MS = 5_000;
+
+let lastEvictionMs = 0;
+
+/**
+ * Opportunistic eviction from the hot path.
+ *
+ * 1. Amortise: skip unless EVICTION_INTERVAL_MS has elapsed.
+ * 2. Drop every expired bucket (the common case under steady traffic).
+ * 3. If still over the cap, delete oldest-first until under it.
+ */
+function evictIfNeeded(now: number): void {
+  if (now - lastEvictionMs < EVICTION_INTERVAL_MS) return;
+  lastEvictionMs = now;
+
+  for (const [key, bucket] of store) {
+    if (now >= bucket.windowEnd) {
+      store.delete(key);
+    }
+  }
+
+  const cap = maxBuckets();
+  if (store.size <= cap) return;
+  let removed = store.size - cap;
+  for (const key of store.keys()) {
+    store.delete(key);
+    if (--removed <= 0) break;
+  }
+}
+
+/**
  * Increment the counter for `storeKey` and return whether the request is
  * allowed.  Creates a new window when none exists or the current one has
  * expired.
@@ -115,6 +170,7 @@ function increment(
   windowMs: number,
 ): { allowed: true; remaining: number; windowEnd: number } | { allowed: false; retryAfterMs: number } {
   const now = Date.now();
+  evictIfNeeded(now);
   let bucket = store.get(storeKey);
 
   if (!bucket || now >= bucket.windowEnd) {
@@ -153,11 +209,43 @@ export function checkLimit(
   limit: number,
   windowMs: number,
 ): RateLimitResult {
+  checkMultiInstanceStoreWarning();
   const result = increment(key, limit, windowMs);
   if (!result.allowed) {
     return { throttled: true, retryAfterMs: result.retryAfterMs };
   }
   return { throttled: false, remaining: result.remaining, windowEnd: result.windowEnd };
+}
+
+/**
+ * Asynchronously check (and record) one request against the pluggable shared store.
+ * If configured with Upstash Redis / Vercel KV, this operates atomically across
+ * multiple instances or serverless workers. If using MemoryStore, delegates to
+ * {@link checkLimit}.
+ */
+export async function checkLimitAsync(
+  key: string,
+  limit: number,
+  windowMs: number,
+): Promise<RateLimitResult> {
+  const sharedStore = getSharedStore();
+  if (sharedStore.name === "memory") {
+    return checkLimit(key, limit, windowMs);
+  }
+
+  const ttlSeconds = Math.ceil(windowMs / 1000);
+  const { count, ttlRemainingMs } = await sharedStore.incr(`rl:${key}`, ttlSeconds);
+  const effectiveTtlMs = ttlRemainingMs > 0 ? ttlRemainingMs : windowMs;
+
+  if (count > limit) {
+    return { throttled: true, retryAfterMs: effectiveTtlMs };
+  }
+
+  return {
+    throttled: false,
+    remaining: Math.max(0, limit - count),
+    windowEnd: Date.now() + effectiveTtlMs,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -322,5 +410,15 @@ export function rateLimitCleanup(): void {
     if (now >= bucket.windowEnd) {
       store.delete(key);
     }
+  }
+  // A manual sweep must keep the same bounded-memory guarantee as the
+  // opportunistic path in evictIfNeeded: if a flood of distinct keys all
+  // arrived inside one window, none will have expired, so trim oldest-first.
+  const cap = maxBuckets();
+  if (store.size <= cap) return;
+  let removed = store.size - cap;
+  for (const key of store.keys()) {
+    store.delete(key);
+    if (--removed <= 0) break;
   }
 }
